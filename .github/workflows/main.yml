@@ -2,6 +2,9 @@ name: RDP
 
 on:
   workflow_dispatch:
+  schedule:
+    # Cron menggunakan UTC. 10:20 WIB (UTC+7) = 03:20 UTC -> cron "20 3 * * *"
+    - cron: '20 3 * * *'
 
 jobs:
   secure-rdp:
@@ -105,3 +108,19 @@ jobs:
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
+
+      # --- Langkah terjadwal: dijalankan hanya ketika trigger = schedule ---
+      - name: Scheduled: restart RDP service (safe)
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          Write-Host "Scheduled run detected (cron). Performing safe restart of RDP service..."
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP service restarted."
+
+      # Jika Anda memang ingin melakukan reboot penuh (RISIKO: akan mematikan runner dan job),
+      # uncomment baris berikut. Gunakan hanya bila Anda paham konsekuensinya.
+      # - name: Scheduled: reboot machine (DANGER)
+      #   if: ${{ github.event_name == 'schedule' }}
+      #   run: |
+      #     Write-Host "Scheduled run detected (cron). Performing full reboot (this will end the job)..."
+      #     Restart-Computer -Force -Confirm:$false
