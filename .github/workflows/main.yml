@@ -1,0 +1,159 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 480
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no existing rule to delete"
+          
+          # Allow incoming connections on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create local user 'A' with generated secure password
+        run: |
+          # Generate a strong-ish password deterministically (GUID-based) and append complexity
+          $pwdCore = (New-Guid).ToString("N").Substring(0,12)
+          $password = "$pwdCore" + "Aa1!"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create or update local user "A"
+          if (-not (Get-LocalUser -Name "A" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "A" -Password $securePass -AccountNeverExpires -PasswordNeverExpires -Description "Auto-created by GH Action"
+          } else {
+              # reset password if user exists
+              Set-LocalUser -Name "A" -Password $securePass
+          }
+
+          # Add to groups (silently continue if already member)
+          Add-LocalGroupMember -Group "Administrators" -Member "A" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "A" -ErrorAction SilentlyContinue
+
+          # Export credentials to GitHub environment for downstream steps
+          # WARNING: This exposes password to subsequent steps that can read GITHUB_ENV
+          "A_CREDS=User: A | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "A")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Ensure Tailscale service and non-interactive up (uses reusable auth key)
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          # Start tailscaled as service if present
+          if (Get-Service -Name tailscaled -ErrorAction SilentlyContinue) {
+              try { Start-Service tailscaled -ErrorAction Stop } catch { Write-Warning "Failed to start tailscaled service: $_" }
+              Start-Sleep -Seconds 2
+          }
+
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $tsExe)) {
+              Write-Error "tailscale.exe not found at $tsExe"
+              exit 1
+          }
+
+          # Validate auth key presence
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              Write-Error "Tailscale auth key is empty. Add it to repo secrets as TAILSCALE_AUTH_KEY."
+              exit 1
+          }
+
+          # Hostname for easier identification in admin console
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          # Non-interactive up using reusable/pre-authorized auth key
+          # Add flags as required for your environment (--accept-routes, --accept-dns, etc).
+          & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes --accept-dns --reset --verbose
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+              Write-Error "tailscale up returned exit code $exitCode"
+              exit 1
+          }
+
+          # Wait for IPv4 assignment
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              Start-Sleep -Seconds 5
+              try {
+                  $ipOut = & $tsExe ip -4 2>$null
+                  if ($ipOut) { $tsIP = $ipOut.Trim() }
+              } catch {}
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned or tailscale up failed."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale connected: $tsIP (hostname: $hostname)"
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Schedule daily restart at 10:00 WIB (Indonesia)
+        run: |
+          # Try to register Scheduled Task with explicit timezone (SE Asia Standard Time), fallback to schtasks UTC-equivalent
+          try {
+              $action = New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument '/r /t 60 /c "Scheduled daily restart at 10:00 WIB"'
+              $trigger = New-ScheduledTaskTrigger -Daily -At 10:00
+              Register-ScheduledTask -TaskName "DailyRestartAt10WIB" -Action $action -Trigger $trigger -RunLevel Highest -User "SYSTEM" -Force -Description "Restart machine daily at 10:00 AM WIB"
+              Write-Host "Scheduled task 'DailyRestartAt10WIB' created (using local machine timezone / trigger 10:00)."
+          } catch {
+              Write-Warning "PowerShell Scheduled Task creation failed or does not support timezone setting. Falling back to schtasks with UTC-equivalent time (03:00 UTC = 10:00 WIB). Error: $_"
+              schtasks /Create /SC DAILY /TN "DailyRestartAt10WIB" /TR "shutdown.exe /r /t 60 /c \"Scheduled daily restart at 10:00 WIB\"" /ST 03:00 /RL HIGHEST /F /RU SYSTEM
+              Write-Host "schtasks fallback created at 03:00 (UTC) which corresponds to 10:00 WIB."
+          }
+
+      - name: Maintain Connection (keep job alive & show credentials)
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: A"
+          Write-Host "Password: (stored in A_CREDS in workflow env)"
+          Write-Host "==================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
