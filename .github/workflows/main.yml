@@ -3,8 +3,8 @@ name: RDP
 on:
   workflow_dispatch:
   schedule:
-    # Cron menggunakan UTC. 10:20 WIB (UTC+7) = 03:20 UTC -> cron "20 3 * * *"
-    - cron: '20 3 * * *'
+    # 10:40 WIB (UTC+7) = 03:40 UTC
+    - cron: '40 3 * * *'
 
 jobs:
   secure-rdp:
@@ -22,47 +22,31 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # Allow incoming connections on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Fixed Secure Password
         run: |
-          # Fixed password (contains upper, lower, number, special)
           $password = 'Amirul10021996'
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Create or update local user "RDP"
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
           } else {
-              # reset password if user exists
               Set-LocalUser -Name "RDP" -Password $securePass
           }
 
-          # Add to groups (silently continue if already member)
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-
-          # Export credentials to GitHub environment
           "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
@@ -70,8 +54,6 @@ jobs:
       - name: Establish Tailscale Connection
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -79,11 +61,7 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
       
       - name: Verify RDP Accessibility
@@ -109,18 +87,10 @@ jobs:
               Start-Sleep -Seconds 300
           }
 
-      # --- Langkah terjadwal: dijalankan hanya ketika trigger = schedule ---
+      # --- Auto restart tiap 10:40 WIB ---
       - name: Scheduled: restart RDP service (safe)
         if: ${{ github.event_name == 'schedule' }}
         run: |
-          Write-Host "Scheduled run detected (cron). Performing safe restart of RDP service..."
+          Write-Host "Scheduled run detected (cron). Restarting RDP service..."
           Restart-Service -Name TermService -Force
-          Write-Host "RDP service restarted."
-
-      # Jika Anda memang ingin melakukan reboot penuh (RISIKO: akan mematikan runner dan job),
-      # uncomment baris berikut. Gunakan hanya bila Anda paham konsekuensinya.
-      # - name: Scheduled: reboot machine (DANGER)
-      #   if: ${{ github.event_name == 'schedule' }}
-      #   run: |
-      #     Write-Host "Scheduled run detected (cron). Performing full reboot (this will end the job)..."
-      #     Restart-Computer -Force -Confirm:$false
+          Write-Host "RDP service restarted successfully at $(Get-Date)."
