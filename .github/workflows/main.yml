@@ -10,6 +10,7 @@ jobs:
 
     steps:
       - name: Configure Core RDP Settings
+        shell: powershell
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -19,9 +20,9 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no existing rule to delete"
-          
+          # Remove any existing firewall rule with the same name to avoid duplication
+          try { netsh advfirewall firewall delete rule name="RDP-Tailscale" } catch {}
+
           # Allow incoming connections on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
@@ -30,26 +31,24 @@ jobs:
           Restart-Service -Name TermService -Force
 
       - name: Create local user 'A' with generated secure password
+        shell: powershell
         run: |
-          # Generate a strong-ish password deterministically (GUID-based) and append complexity
+          # NOTE: This generates a password and exports it to GITHUB_ENV.
+          # If you prefer NOT to export the password, remove the line that writes to $env:GITHUB_ENV.
           $pwdCore = (New-Guid).ToString("N").Substring(0,12)
           $password = "$pwdCore" + "Aa1!"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Create or update local user "A"
           if (-not (Get-LocalUser -Name "A" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "A" -Password $securePass -AccountNeverExpires -PasswordNeverExpires -Description "Auto-created by GH Action"
           } else {
-              # reset password if user exists
               Set-LocalUser -Name "A" -Password $securePass
           }
 
-          # Add to groups (silently continue if already member)
           Add-LocalGroupMember -Group "Administrators" -Member "A" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "A" -ErrorAction SilentlyContinue
 
-          # Export credentials to GitHub environment for downstream steps
-          # WARNING: This exposes password to subsequent steps that can read GITHUB_ENV
+          # Export credentials to GitHub environment for downstream steps (sensitive!)
           "A_CREDS=User: A | Password: $password" >> $env:GITHUB_ENV
 
           if (-not (Get-LocalUser -Name "A")) {
@@ -58,6 +57,7 @@ jobs:
           }
 
       - name: Install Tailscale
+        shell: powershell
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
@@ -71,7 +71,17 @@ jobs:
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Start tailscaled as service if present
+          # Helpful pre-check for common secret issues
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              Write-Host "ERROR: Tailscale auth key is empty."
+              Write-Host "Possible causes:"
+              Write-Host " - You haven't added a repo secret named 'TAILSCALE_AUTH_KEY' (Settings → Secrets and variables → Actions)."
+              Write-Host " - You're running this workflow from a fork/PR where repo secrets are not available."
+              Write-Host " - The secret value was accidentally left blank or has a typing error."
+              exit 1
+          }
+
+          # Start tailscaled service if present
           if (Get-Service -Name tailscaled -ErrorAction SilentlyContinue) {
               try { Start-Service tailscaled -ErrorAction Stop } catch { Write-Warning "Failed to start tailscaled service: $_" }
               Start-Sleep -Seconds 2
@@ -83,21 +93,12 @@ jobs:
               exit 1
           }
 
-          # Validate auth key presence
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              Write-Error "Tailscale auth key is empty. Add it to repo secrets as TAILSCALE_AUTH_KEY."
-              exit 1
-          }
-
-          # Hostname for easier identification in admin console
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
 
           # Non-interactive up using reusable/pre-authorized auth key
-          # Add flags as required for your environment (--accept-routes, --accept-dns, etc).
           & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --accept-routes --accept-dns --reset --verbose
-          $exitCode = $LASTEXITCODE
-          if ($exitCode -ne 0) {
-              Write-Error "tailscale up returned exit code $exitCode"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "tailscale up returned exit code $LASTEXITCODE. Check the auth key type (must be reusable) and admin console for device logs."
               exit 1
           }
 
@@ -106,15 +107,12 @@ jobs:
           $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
               Start-Sleep -Seconds 5
-              try {
-                  $ipOut = & $tsExe ip -4 2>$null
-                  if ($ipOut) { $tsIP = $ipOut.Trim() }
-              } catch {}
+              try { $ipOut = & $tsExe ip -4 2>$null; if ($ipOut) { $tsIP = $ipOut.Trim() } } catch {}
               $retries++
           }
 
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned or tailscale up failed."
+              Write-Error "Tailscale up succeeded but no IP assigned. Check tailscaled logs and admin console."
               exit 1
           }
 
@@ -122,6 +120,7 @@ jobs:
           Write-Host "Tailscale connected: $tsIP (hostname: $hostname)"
 
       - name: Verify RDP Accessibility
+        shell: powershell
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
@@ -132,8 +131,8 @@ jobs:
           Write-Host "TCP connectivity successful!"
 
       - name: Schedule daily restart at 10:00 WIB (Indonesia)
+        shell: powershell
         run: |
-          # Try to register Scheduled Task with explicit timezone (SE Asia Standard Time), fallback to schtasks UTC-equivalent
           try {
               $action = New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument '/r /t 60 /c "Scheduled daily restart at 10:00 WIB"'
               $trigger = New-ScheduledTaskTrigger -Daily -At 10:00
@@ -146,6 +145,7 @@ jobs:
           }
 
       - name: Maintain Connection (keep job alive & show credentials)
+        shell: powershell
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
